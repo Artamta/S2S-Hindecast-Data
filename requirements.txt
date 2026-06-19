@@ -1,0 +1,9 @@
+cdsapi
+pandas
+numpy
+xarray
+cfgrib
+huggingface_hub
+zarr
+arraylake
+py7zr

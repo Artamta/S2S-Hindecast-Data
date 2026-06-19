@@ -1,0 +1,26 @@
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data files — never commit large data
+*.grib
+*.nc
+*.zarr
+*.7z
+*.zip
+*.tar.gz
+
+# OS
+.DS_Store
