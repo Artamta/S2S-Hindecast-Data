@@ -7,12 +7,12 @@ Download ECMWF S2S reforecasts (hindcasts) from ECDS.
 ECMWF S2S reforecast initialization frequency depends on the model cycle:
 
   - CY48R1 and earlier (before 12 Nov 2024): Mon + Thu only (twice weekly)
-  - CY49R1+ (from 12 Nov 2024, current):     Every odd day of month
-                                              (1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31)
+  - CY49R1+ (from 12 Nov 2024, current):     Fixed days of month: 1/5/9/13/17/21/25/29
+                                              (every 4 days, ~8 init dates/month)
 
-This script targets the current CY49R1+ schedule: ~15 init dates/month,
-covering all odd calendar days.  Each request returns all 20 hindcast years
-(2000-2019) packed in a single file.
+Note: real-time forecasts became daily in CY48R1 (Jun 2023), but the
+on-the-fly REFORECASTS (used for climatology) follow the 1/5/9/13/17/21/25/29
+schedule in CY49R1+.  Each request returns all 20 hindcast years (2000-2019).
 
 Variables
 ---------
@@ -162,12 +162,13 @@ def _done(p: Path) -> bool:
 
 
 def generate_init_dates(year_start: int, year_end: int) -> list[pd.Timestamp]:
-    """All odd-day-of-month dates in [year_start, year_end] (CY49R1+ schedule).
-    Odd days: 1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31 of each month.
-    Feb 29 is excluded (leap year odd day that doesn't exist in most years).
+    """Reforecast init dates for CY49R1+ schedule: 1/5/9/13/17/21/25/29 of each month.
+    This is ~8 dates/month (~96/year), up from Mon+Thu (~104/year but tied to weekday).
+    Feb 29 is excluded as it doesn't exist in most years.
     """
+    valid_days = {1, 5, 9, 13, 17, 21, 25, 29}
     dates = pd.date_range(f"{year_start}-01-01", f"{year_end}-12-31", freq="D")
-    return [d for d in dates if d.day % 2 == 1]
+    return [d for d in dates if d.day in valid_days and not (d.month == 2 and d.day == 29)]
 
 
 def build_tasks(dates: list[pd.Timestamp], ftypes: list[str],
@@ -270,8 +271,8 @@ def main():
 
     if args.date:
         dates = [pd.Timestamp(args.date)]
-        if dates[0].day % 2 == 0:
-            log.warning(f"{args.date} is an even day — CY49R1+ reforecasts are issued on odd days only.")
+        if dates[0].day not in {1, 5, 9, 13, 17, 21, 25, 29}:
+            log.warning(f"{args.date} is not a CY49R1+ reforecast day (1/5/9/13/17/21/25/29).")
     else:
         dates = generate_init_dates(args.year_start, args.year_end)
 
@@ -286,7 +287,7 @@ def main():
     log.info("ECMWF S2S Reforecast Downloader")
     log.info(f"  Output      : {OUT_BASE}")
     log.info(f"  Init dates  : {len(dates)}  ({dates[0].date()} → {dates[-1].date()})")
-    log.info(f"  NOTE: CY49R1+ reforecasts on odd days of month (1,3,5...31)")
+    log.info(f"  NOTE: CY49R1+ reforecasts on days 1/5/9/13/17/21/25/29 of month")
     log.info(f"  Fcst types  : {ftypes}")
     log.info(f"  Sfc vars    : {list(SURFACE_VARS.values()) if do_sfc else 'skipped'}")
     log.info(f"  PL vars     : {list(PL_VARS.values())} @ {PRESSURE_LEVELS} hPa" if do_pl else "  PL vars     : skipped")
