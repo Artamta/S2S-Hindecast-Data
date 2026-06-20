@@ -2,81 +2,60 @@
 """
 ecmwf_reforecast.py
 ===================
-Download ECMWF S2S reforecasts (hindcasts) from ECDS.
+Download ECMWF S2S reforecasts (hindcasts) for climatology computation.
 
-ECMWF S2S reforecast initialization frequency depends on the model cycle:
+Target variables (6 — paper-relevant):
+  Surface  : tp, 2t, mx2t, mn2t, msl
+  Pressure : z @ 500 hPa (Z500)
 
-  - CY48R1 and earlier (before 12 Nov 2024): Mon + Thu only (twice weekly)
-  - CY49R1+ (from 12 Nov 2024, current):     Fixed days of month: 1/5/9/13/17/21/25/29
-                                              (every 4 days, ~8 init dates/month)
+Forecast types : control (cf) + perturbed (pf) members
+Lead time      : day 1 – 90  (steps 24, 48, … 2160 h)
+Hindcast period: 2000 – 2019  (20 years, packed per request)
 
-Note: real-time forecasts became daily in CY48R1 (Jun 2023), but the
-on-the-fly REFORECASTS (used for climatology) follow the 1/5/9/13/17/21/25/29
-schedule in CY49R1+.  Each request returns all 20 hindcast years (2000-2019).
-
-Variables
----------
-Surface (single_level):
-  tp   — total precipitation
-  2t   — 2 m temperature
-  mx2t — maximum 2 m temperature in last 24 h
-  mn2t — minimum 2 m temperature in last 24 h
-  msl  — mean sea level pressure
-
-Pressure level:
-  z, t, u, v, q  at 200 / 500 / 850 / 1000 hPa
+Init date schedule (CY49R1+, operational since 12 Nov 2024):
+  Days 1 / 5 / 9 / 13 / 17 / 21 / 25 / 29 of each month
+  → 8 dates/month × 12 months × 20 years = 1900 init dates total
 
 Output layout
 -------------
-  <OUT_BASE>/
-  ├── tp/   <YYYYMMDD>_cf.nc   <YYYYMMDD>_pf.nc  ...
-  ├── 2t/   ...
-  ├── mx2t/ ...
-  ├── mn2t/ ...
-  ├── msl/  ...
-  ├── z/200/  z/500/  z/850/  z/1000/
-  ├── t/200/  ...
-  ├── u/200/  ...
-  ├── v/200/  ...
-  └── q/200/  ...
+  /storage/raj.ayush/All_Model_Data/ecmwf/reforecasts/
+  ├── tp/        <YYYYMMDD>_cf.nc   <YYYYMMDD>_pf.nc  ...
+  ├── 2t/
+  ├── mx2t/
+  ├── mn2t/
+  ├── msl/
+  └── z/
+      └── 500/   <YYYYMMDD>_cf.nc  ...
 
-Each file: one init date × one variable (× one level for PL vars)
-           × one forecast type (cf / pf), NetCDF format.
-
-Logs → <OUT_BASE>/_logs/
+Logs
+----
+  /storage/raj.ayush/s2s-data-pipeline/logs/ecmwf/
+  ├── download_YYYYMMDD_HHMMSS.log   ← human-readable run log
+  └── requests.jsonl                 ← one JSON record per completed file
 
 Usage
 -----
-  # Dry-run: show what would be downloaded
+  # Dry-run on login node (always do this first)
   python download/ecmwf_reforecast.py --dry-run
 
-  # All init dates, all variables (2000-2019)
-  python download/ecmwf_reforecast.py
+  # Single date test (verify API works)
+  python download/ecmwf_reforecast.py --date 2000-01-01 --dry-run
+  python download/ecmwf_reforecast.py --date 2000-01-01
 
-  # Single init date test
-  python download/ecmwf_reforecast.py --date 2020-01-02
+  # Full download (submit via SLURM — see slurm/ecmwf_download.sbatch)
+  python download/ecmwf_reforecast.py --workers 4
 
-  # Surface variables only (faster)
+  # Surface only
   python download/ecmwf_reforecast.py --sfc-only
 
-  # Pressure-level variables only
-  python download/ecmwf_reforecast.py --pl-only
-
-  # Skip perturbed members (cf only)
+  # Control forecast only (no perturbed members)
   python download/ecmwf_reforecast.py --no-pf
-
-  # More parallel workers
-  python download/ecmwf_reforecast.py --workers 6
-
-  # Run in background via tmux
-  tmux new -s ecmwf_dl
-  python download/ecmwf_reforecast.py --workers 4
-  Ctrl+B D  to detach
 
 Requirements
 ------------
-  pip install cdsapi pandas
-  ~/.cdsapirc must contain your ECDS key (url: https://ecds.ecmwf.int/api)
+  conda activate s2s-hind
+  ~/.cdsapirc  →  url: https://ecds.ecmwf.int/api
+                  key: <your-key>
   cdsapi >= 0.7.7
 """
 
@@ -93,18 +72,22 @@ import cdsapi
 import pandas as pd
 
 # ── PATHS ─────────────────────────────────────────────────────────────────────
-OUT_BASE = Path("/storage/raj.ayush/All_Model_Data/ecmwf/reforecasts")
-LOG_DIR  = OUT_BASE / "_logs"
+DATA_DIR = Path("/storage/raj.ayush/All_Model_Data/ecmwf/reforecasts")
+LOG_DIR  = Path("/storage/raj.ayush/s2s-data-pipeline/logs/ecmwf")
 
 # ── HINDCAST PERIOD ───────────────────────────────────────────────────────────
-# ECMWF provides a 20-year hindcast window.  All Mon+Thu dates in this range
-# are valid init dates; each request returns all 20 years stacked internally.
 YEAR_START = 2000
 YEAR_END   = 2019
 
-# ── CDS REQUEST PARAMETERS ────────────────────────────────────────────────────
-STEPS = [str(h) for h in range(24, 24 * 46 + 1, 24)]   # day 1–46
+# CY49R1+ reforecast init schedule: fixed days of month
+REFORECAST_DAYS = {1, 5, 9, 13, 17, 21, 25, 29}
 
+# ── FORECAST LEAD TIME ────────────────────────────────────────────────────────
+# 90 days at 24-hour intervals
+STEPS = [str(h) for h in range(24, 90 * 24 + 1, 24)]   # "24","48",...,"2160"
+
+# ── VARIABLES ─────────────────────────────────────────────────────────────────
+# 5 surface + Z500 = 6 paper-relevant variables
 SURFACE_VARS = {
     "total_precipitation":                          "tp",
     "2m_temperature":                               "2t",
@@ -113,16 +96,13 @@ SURFACE_VARS = {
     "mean_sea_level_pressure":                      "msl",
 }
 
+# Only Z500 at pressure level (most relevant for S2S dynamics)
 PL_VARS = {
-    "geopotential":          "z",
-    "temperature":           "t",
-    "u_component_of_wind":   "u",
-    "v_component_of_wind":   "v",
-    "specific_humidity":     "q",
+    "geopotential": "z",
 }
+PRESSURE_LEVELS = ["500"]
 
-PRESSURE_LEVELS = ["200", "500", "850", "1000"]
-
+# ── FORECAST TYPES ────────────────────────────────────────────────────────────
 FTYPES = {
     "cf": "control_reforecast",
     "pf": "perturbed_reforecast",
@@ -130,13 +110,13 @@ FTYPES = {
 
 # ── RETRY ─────────────────────────────────────────────────────────────────────
 MAX_RETRIES   = 5
-RETRY_BACKOFF = [30, 60, 120, 300, 600]
+RETRY_BACKOFF = [30, 60, 120, 300, 600]   # seconds
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
-def _setup_logging() -> logging.Logger:
+def setup_logging(run_id: str) -> tuple[logging.Logger, Path]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = LOG_DIR / f"download_{datetime.now():%Y%m%d_%H%M%S}.log"
+    log_file = LOG_DIR / f"download_{run_id}.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -146,29 +126,26 @@ def _setup_logging() -> logging.Logger:
         ],
     )
     log = logging.getLogger(__name__)
-    log.info(f"Log file: {log_file}")
-    return log
+    return log, log_file
 
 
-def _outpath(short_name: str, date: pd.Timestamp, ftype_key: str,
-             level: str | None = None) -> Path:
-    d = OUT_BASE / short_name / level if level else OUT_BASE / short_name
+def outpath(short_name: str, date: pd.Timestamp, ftype_key: str,
+            level: str | None = None) -> Path:
+    d = DATA_DIR / short_name / level if level else DATA_DIR / short_name
     d.mkdir(parents=True, exist_ok=True)
     return d / f"{date:%Y%m%d}_{ftype_key}.nc"
 
 
-def _done(p: Path) -> bool:
+def is_done(p: Path) -> bool:
     return p.exists() and p.stat().st_size > 0
 
 
 def generate_init_dates(year_start: int, year_end: int) -> list[pd.Timestamp]:
-    """Reforecast init dates for CY49R1+ schedule: 1/5/9/13/17/21/25/29 of each month.
-    This is ~8 dates/month (~96/year), up from Mon+Thu (~104/year but tied to weekday).
-    Feb 29 is excluded as it doesn't exist in most years.
-    """
-    valid_days = {1, 5, 9, 13, 17, 21, 25, 29}
-    dates = pd.date_range(f"{year_start}-01-01", f"{year_end}-12-31", freq="D")
-    return [d for d in dates if d.day in valid_days and not (d.month == 2 and d.day == 29)]
+    all_days = pd.date_range(f"{year_start}-01-01", f"{year_end}-12-31", freq="D")
+    return [
+        d for d in all_days
+        if d.day in REFORECAST_DAYS and not (d.month == 2 and d.day == 29)
+    ]
 
 
 def build_tasks(dates: list[pd.Timestamp], ftypes: list[str],
@@ -176,7 +153,7 @@ def build_tasks(dates: list[pd.Timestamp], ftypes: list[str],
     tasks = []
     for date in dates:
         for ftype_key in ftypes:
-            base_req = {
+            base = {
                 "origin":        "ecmwf",
                 "forecast_type": FTYPES[ftype_key],
                 "year":          str(date.year),
@@ -187,43 +164,45 @@ def build_tasks(dates: list[pd.Timestamp], ftypes: list[str],
                 "data_format":   "netcdf",
             }
             if do_sfc:
-                for cds_name, short_name in SURFACE_VARS.items():
+                for cds_name, short in SURFACE_VARS.items():
+                    p = outpath(short, date, ftype_key)
                     tasks.append({
-                        "out":   str(_outpath(short_name, date, ftype_key)),
-                        "req":   {**base_req, "level_type": "single_level",
-                                  "variable": cds_name},
-                        "label": f"{short_name}/{date:%Y%m%d}_{ftype_key}.nc",
+                        "out":   str(p),
+                        "req":   {**base, "level_type": "single_level", "variable": cds_name},
+                        "label": f"{short}/{date:%Y%m%d}_{ftype_key}.nc",
                     })
             if do_pl:
-                for cds_name, short_name in PL_VARS.items():
+                for cds_name, short in PL_VARS.items():
                     for lev in PRESSURE_LEVELS:
+                        p = outpath(short, date, ftype_key, lev)
                         tasks.append({
-                            "out":   str(_outpath(short_name, date, ftype_key, lev)),
-                            "req":   {**base_req, "level_type": "pressure_level",
+                            "out":   str(p),
+                            "req":   {**base, "level_type": "pressure_level",
                                       "variable": cds_name, "level": lev},
-                            "label": f"{short_name}/{lev}/{date:%Y%m%d}_{ftype_key}.nc",
+                            "label": f"{short}/{lev}/{date:%Y%m%d}_{ftype_key}.nc",
                         })
     return tasks
 
 
-# ── DOWNLOAD ──────────────────────────────────────────────────────────────────
+# ── DOWNLOAD WORKER ───────────────────────────────────────────────────────────
 def download_one(task: dict, log: logging.Logger, req_log: Path) -> dict:
     out = Path(task["out"])
-    if _done(out):
-        log.info(f"SKIP  {task['label']}")
+
+    if is_done(out):
+        log.info(f"SKIP   {task['label']}")
         return {**task, "status": "skipped"}
 
+    client   = cdsapi.Client(quiet=True)
     last_exc = None
-    client = cdsapi.Client(quiet=True)
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            log.info(f"START {task['label']}  (attempt {attempt})")
+            log.info(f"START  {task['label']}  (attempt {attempt}/{MAX_RETRIES})")
             t0 = time.time()
             client.retrieve("s2s-reforecasts", task["req"], str(out))
             elapsed = time.time() - t0
             size_mb = out.stat().st_size / 1024 ** 2
-            log.info(f"DONE  {task['label']}  {size_mb:.1f} MB  {elapsed:.0f}s")
+            log.info(f"DONE   {task['label']}  {size_mb:.1f} MB  {elapsed:.0f}s")
             rec = {**task, "status": "success", "size_mb": round(size_mb, 2),
                    "elapsed_s": round(elapsed, 1), "ts": datetime.utcnow().isoformat()}
             with open(req_log, "a") as f:
@@ -231,13 +210,13 @@ def download_one(task: dict, log: logging.Logger, req_log: Path) -> dict:
             return rec
         except Exception as exc:
             last_exc = exc
-            log.warning(f"FAIL  {task['label']}  attempt {attempt}: {exc}")
+            log.warning(f"RETRY  {task['label']}  attempt {attempt}: {exc}")
             if attempt < MAX_RETRIES:
                 wait = RETRY_BACKOFF[attempt - 1]
-                log.info(f"      retrying in {wait}s ...")
+                log.info(f"       waiting {wait}s ...")
                 time.sleep(wait)
 
-    log.error(f"GIVE UP {task['label']}: {last_exc}")
+    log.error(f"FAIL   {task['label']} after {MAX_RETRIES} attempts: {last_exc}")
     rec = {**task, "status": "failed", "error": str(last_exc),
            "ts": datetime.utcnow().isoformat()}
     with open(req_log, "a") as f:
@@ -248,31 +227,38 @@ def download_one(task: dict, log: logging.Logger, req_log: Path) -> dict:
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Download ECMWF S2S reforecasts — all Mon+Thu inits, 2000-2019."
+        description="Download ECMWF S2S reforecasts for climatology (90-day, 6 vars)."
     )
     parser.add_argument("--date",       type=str, default=None,
-                        help="Single init date YYYY-MM-DD (must be Mon or Thu)")
-    parser.add_argument("--year-start", type=int, default=YEAR_START)
-    parser.add_argument("--year-end",   type=int, default=YEAR_END)
+                        help="Single init date YYYY-MM-DD for testing")
+    parser.add_argument("--year-start", type=int, default=YEAR_START,
+                        help=f"First year (default {YEAR_START})")
+    parser.add_argument("--year-end",   type=int, default=YEAR_END,
+                        help=f"Last year (default {YEAR_END})")
     parser.add_argument("--no-pf",     action="store_true",
-                        help="Skip perturbed reforecast; control only")
+                        help="Control forecast only (skip perturbed members)")
     parser.add_argument("--sfc-only",  action="store_true",
-                        help="Surface variables only")
+                        help="Surface variables only (tp, 2t, mx2t, mn2t, msl)")
     parser.add_argument("--pl-only",   action="store_true",
-                        help="Pressure-level variables only")
+                        help="Pressure-level only (Z500)")
     parser.add_argument("--workers",   type=int, default=4,
                         help="Parallel download threads (default 4)")
     parser.add_argument("--dry-run",   action="store_true",
-                        help="Show pending tasks without downloading")
+                        help="Print all tasks, download nothing")
     args = parser.parse_args()
 
-    log     = _setup_logging()
+    run_id  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log, log_file = setup_logging(run_id)
     req_log = LOG_DIR / "requests.jsonl"
 
+    # Build date list
     if args.date:
         dates = [pd.Timestamp(args.date)]
-        if dates[0].day not in {1, 5, 9, 13, 17, 21, 25, 29}:
-            log.warning(f"{args.date} is not a CY49R1+ reforecast day (1/5/9/13/17/21/25/29).")
+        if dates[0].day not in REFORECAST_DAYS:
+            log.warning(
+                f"{args.date} is not a CY49R1+ reforecast day "
+                f"(valid: {sorted(REFORECAST_DAYS)})"
+            )
     else:
         dates = generate_init_dates(args.year_start, args.year_end)
 
@@ -281,34 +267,44 @@ def main():
     do_pl  = not args.sfc_only
 
     tasks   = build_tasks(dates, ftypes, do_sfc, do_pl)
-    pending = [t for t in tasks if not _done(Path(t["out"]))]
+    pending = [t for t in tasks if not is_done(Path(t["out"]))]
+    n_done  = len(tasks) - len(pending)
 
-    log.info("=" * 68)
-    log.info("ECMWF S2S Reforecast Downloader")
-    log.info(f"  Output      : {OUT_BASE}")
-    log.info(f"  Init dates  : {len(dates)}  ({dates[0].date()} → {dates[-1].date()})")
-    log.info(f"  NOTE: CY49R1+ reforecasts on days 1/5/9/13/17/21/25/29 of month")
+    log.info("=" * 70)
+    log.info("ECMWF S2S Reforecast Download")
+    log.info(f"  Data dir    : {DATA_DIR}")
+    log.info(f"  Log dir     : {LOG_DIR}")
+    log.info(f"  Log file    : {log_file}")
+    log.info(f"  Init dates  : {len(dates)}  "
+             f"({dates[0].date()} → {dates[-1].date()})")
+    log.info(f"  Schedule    : days {sorted(REFORECAST_DAYS)} of each month (CY49R1+)")
     log.info(f"  Fcst types  : {ftypes}")
+    log.info(f"  Lead time   : 90 days  (steps 24–2160 h)")
     log.info(f"  Sfc vars    : {list(SURFACE_VARS.values()) if do_sfc else 'skipped'}")
-    log.info(f"  PL vars     : {list(PL_VARS.values())} @ {PRESSURE_LEVELS} hPa" if do_pl else "  PL vars     : skipped")
-    log.info(f"  Total tasks : {len(tasks)}  |  done: {len(tasks)-len(pending)}  |  pending: {len(pending)}")
+    log.info(f"  PL vars     : z @ 500 hPa" if do_pl else "  PL vars     : skipped")
+    log.info(f"  Tasks total : {len(tasks)}")
+    log.info(f"  Already done: {n_done}")
+    log.info(f"  Pending     : {len(pending)}")
     log.info(f"  Workers     : {args.workers}")
-    log.info("=" * 68)
+    log.info("=" * 70)
 
     if args.dry_run:
+        log.info("DRY RUN — listing all tasks:")
         for t in tasks:
-            tag = "EXISTS " if _done(Path(t["out"])) else "PENDING"
-            print(f"  [{tag}] {t['label']}")
-        log.info("Dry-run complete — nothing downloaded.")
+            tag = "EXISTS" if is_done(Path(t["out"])) else "PENDING"
+            log.info(f"  [{tag}]  {t['label']}")
+        log.info("=" * 70)
+        log.info(f"Dry-run complete.  {len(pending)} files would be downloaded.")
         return
 
     if not pending:
-        log.info("Nothing to download.")
+        log.info("Nothing to download — all files already exist.")
         return
 
-    counts = {"success": 0, "skipped": len(tasks) - len(pending), "failed": 0}
+    # ── Run downloads ─────────────────────────────────────────────────────────
+    counts = {"success": 0, "skipped": n_done, "failed": 0}
     failed = []
-    done_n = counts["skipped"]
+    done_n = n_done
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(download_one, t, log, req_log): t for t in pending}
@@ -323,18 +319,24 @@ def main():
                 counts["failed"] += 1
                 log.error(f"Worker exception: {exc}")
             pct = 100 * done_n / len(tasks)
-            log.info(f"Progress {done_n}/{len(tasks)} ({pct:.1f}%)  "
-                     f"ok={counts['success']} skip={counts['skipped']} fail={counts['failed']}")
+            log.info(
+                f"Progress {done_n}/{len(tasks)} ({pct:.1f}%)  "
+                f"ok={counts['success']}  skip={counts['skipped']}  "
+                f"fail={counts['failed']}"
+            )
 
-    log.info("=" * 68)
+    log.info("=" * 70)
     log.info("DOWNLOAD COMPLETE")
-    log.info(f"  Success  : {counts['success']}")
-    log.info(f"  Skipped  : {counts['skipped']}")
-    log.info(f"  Failed   : {counts['failed']}")
-    for f in failed:
-        log.info(f"    FAILED: {f}")
-    log.info(f"  Req log  : {req_log}")
-    log.info("=" * 68)
+    log.info(f"  Success : {counts['success']}")
+    log.info(f"  Skipped : {counts['skipped']}")
+    log.info(f"  Failed  : {counts['failed']}")
+    if failed:
+        log.info("  Failed files:")
+        for f in failed:
+            log.info(f"    {f}")
+    log.info(f"  Log     : {log_file}")
+    log.info(f"  Req log : {req_log}")
+    log.info("=" * 70)
 
 
 if __name__ == "__main__":
