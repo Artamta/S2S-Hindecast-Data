@@ -1,61 +1,61 @@
 #!/usr/bin/env python3
 """
-ecmwf_reforecast.py
-===================
-Download ECMWF S2S reforecasts (hindcasts) for climatology computation.
+ecmwf_forecast_jfm2026.py
+==========================
+Download ECMWF S2S real-time operational forecasts for JFM 2026
+(January – March 2026, all available init dates).
 
-Ensemble size (reforecasts):
-  CY49R1+ (current): 11 members total — 1 control (cf) + 10 perturbed (pf)
-  NOTE: Real-time forecasts have 101 members, but REFORECASTS only have 11.
-        200-member reforecasts do NOT exist in the ECMWF S2S system.
+This is the ACTUAL forecast data used for verification — NOT hindcasts.
 
-Init schedule (CY49R1+, since 12 Nov 2024):
-  Days 1 / 5 / 9 / 13 / 17 / 21 / 25 / 29 of each month
-  → 8 dates/month × 12 months × 20 years = 1900 init dates
+Ensemble size (real-time forecasts, CY49R1+):
+  101 members total — 1 control (cf) + 100 perturbed (pf)
 
-Hindcast period : 2000 – 2019  (20 years, packed per file)
-Lead time       : 90 days  (steps 24, 48, … 2160 h)
+Init dates (CY49R1+, daily since 12 Nov 2024):
+  Every day in JFM 2026: 2026-01-01 → 2026-03-31  (90 dates)
 
-Variables (6 — paper-relevant):
-  Surface   : tp, 2t, mx2t, mn2t, msl
-  Pressure  : z @ 500 hPa (Z500)
+Lead time : 90 days  (steps 24, 48, … 2160 h)
+Dataset   : s2s-forecasts  (NOT s2s-reforecasts)
+
+Variables (6 — same as reforecast script):
+  Surface  : tp, 2t, mx2t, mn2t, msl
+  Pressure : z @ 500 hPa (Z500)
 
 Output
 ------
-  /storage/raj.ayush/All_Model_Data/ecmwf/reforecasts/
+  /storage/raj.ayush/All_Model_Data/ecmwf/jfm2026/
   ├── tp/        YYYYMMDD_cf.nc   YYYYMMDD_pf.nc
-  ├── 2t/        YYYYMMDD_cf.nc   YYYYMMDD_pf.nc
+  ├── 2t/        ...
   ├── mx2t/      ...
   ├── mn2t/      ...
   ├── msl/       ...
   └── z/500/     YYYYMMDD_cf.nc   YYYYMMDD_pf.nc
 
   Each file: one init date × one variable × one fcst type
-             shape: (hindcast_year=20, lead_day=90, lat, lon) for cf
-                    (member=10, hindcast_year=20, lead_day=90, lat, lon) for pf
+             cf shape: (lead_day=90, lat, lon)
+             pf shape: (member=100, lead_day=90, lat, lon)
 
 Logs
 ----
-  /storage/raj.ayush/s2s-data-pipeline/logs/ecmwf/hindcast/
-  ├── run_YYYYMMDD_HHMMSS.log    human-readable
-  └── requests.jsonl             one JSON line per file
+  /storage/raj.ayush/s2s-data-pipeline/logs/ecmwf/jfm2026/
+  ├── run_YYYYMMDD_HHMMSS.log
+  └── requests.jsonl
 
 Usage
 -----
-  # Dry-run (always do this first on login node)
-  python download/ecmwf_reforecast.py --dry-run
+  # Dry-run on login node (do this first)
+  python download/ecmwf_forecast_jfm2026.py --dry-run
 
   # Single date test
-  python download/ecmwf_reforecast.py --date 2000-01-01
+  python download/ecmwf_forecast_jfm2026.py --date 2026-01-01
 
-  # Full run (via SLURM — see slurm/ecmwf_hindcast.sbatch)
-  python download/ecmwf_reforecast.py --workers 4
+  # Full run (via SLURM — see slurm/ecmwf_jfm2026.sbatch)
+  python download/ecmwf_forecast_jfm2026.py --workers 4
 
   # Surface only
-  python download/ecmwf_reforecast.py --sfc-only
+  python download/ecmwf_forecast_jfm2026.py --sfc-only
 
-  # Control only (no perturbed)
-  python download/ecmwf_reforecast.py --no-pf
+  # Control only
+  python download/ecmwf_forecast_jfm2026.py --no-pf
 
 Requirements
 ------------
@@ -77,15 +77,13 @@ import cdsapi
 import pandas as pd
 
 # ── PATHS ─────────────────────────────────────────────────────────────────────
-DATA_DIR = Path("/storage/raj.ayush/All_Model_Data/ecmwf/reforecasts")
-LOG_DIR  = Path("/storage/raj.ayush/s2s-data-pipeline/logs/ecmwf/hindcast")
+DATA_DIR = Path("/storage/raj.ayush/All_Model_Data/ecmwf/jfm2026")
+LOG_DIR  = Path("/storage/raj.ayush/s2s-data-pipeline/logs/ecmwf/jfm2026")
 
-# ── HINDCAST PERIOD ───────────────────────────────────────────────────────────
-YEAR_START = 2000
-YEAR_END   = 2019
-
-# CY49R1+ reforecast init days
-REFORECAST_DAYS = {1, 5, 9, 13, 17, 21, 25, 29}
+# ── FORECAST PERIOD ───────────────────────────────────────────────────────────
+# All daily init dates in JFM 2026
+DATE_START = "2026-01-01"
+DATE_END   = "2026-03-31"
 
 # ── FORECAST CONFIGURATION ────────────────────────────────────────────────────
 # 90-day lead time at daily resolution
@@ -99,13 +97,13 @@ SURFACE_VARS = {
     "minimum_2m_temperature_in_the_last_24_hours":  "mn2t",
     "mean_sea_level_pressure":                      "msl",
 }
-PL_VARS    = {"geopotential": "z"}
-PL_LEVELS  = ["500"]
+PL_VARS   = {"geopotential": "z"}
+PL_LEVELS = ["500"]
 
-# Forecast types
+# Forecast types (real-time uses control_forecast / perturbed_forecast)
 FTYPES = {
-    "cf": "control_reforecast",
-    "pf": "perturbed_reforecast",
+    "cf": "control_forecast",
+    "pf": "perturbed_forecast",
 }
 
 # ── RETRY ─────────────────────────────────────────────────────────────────────
@@ -136,12 +134,6 @@ def outpath(var: str, date: pd.Timestamp, ftype: str, level: str | None = None) 
 
 def is_done(p: Path) -> bool:
     return p.exists() and p.stat().st_size > 0
-
-
-def init_dates(year_start: int, year_end: int) -> list[pd.Timestamp]:
-    all_days = pd.date_range(f"{year_start}-01-01", f"{year_end}-12-31", freq="D")
-    return [d for d in all_days
-            if d.day in REFORECAST_DAYS and not (d.month == 2 and d.day == 29)]
 
 
 def build_tasks(dates: list[pd.Timestamp], ftypes: list[str],
@@ -185,7 +177,7 @@ def download_one(task: dict, log: logging.Logger, req_log: Path) -> dict:
         try:
             log.info(f"START  {task['label']}  (attempt {attempt}/{MAX_RETRIES})")
             t0 = time.time()
-            client.retrieve("s2s-reforecasts", task["req"], str(out))
+            client.retrieve("s2s-forecasts", task["req"], str(out))
             elapsed = time.time() - t0
             mb = out.stat().st_size / 1024 ** 2
             log.info(f"DONE   {task['label']}  {mb:.1f} MB  {elapsed:.0f}s")
@@ -212,17 +204,15 @@ def download_one(task: dict, log: logging.Logger, req_log: Path) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download ECMWF S2S reforecasts 2000-2019 (11 members, 90-day, 6 vars)."
+        description="Download ECMWF S2S real-time forecasts JFM 2026 (101 members, 90-day, 6 vars)."
     )
-    parser.add_argument("--date",       type=str, default=None,
+    parser.add_argument("--date",      type=str, default=None,
                         help="Single init date YYYY-MM-DD for testing")
-    parser.add_argument("--year-start", type=int, default=YEAR_START)
-    parser.add_argument("--year-end",   type=int, default=YEAR_END)
-    parser.add_argument("--no-pf",     action="store_true", help="Control only (no perturbed)")
-    parser.add_argument("--sfc-only",  action="store_true", help="Surface vars only")
-    parser.add_argument("--pl-only",   action="store_true", help="Pressure-level only (Z500)")
-    parser.add_argument("--workers",   type=int, default=4, help="Parallel threads (default 4)")
-    parser.add_argument("--dry-run",   action="store_true", help="Print tasks, download nothing")
+    parser.add_argument("--no-pf",    action="store_true", help="Control only (no perturbed)")
+    parser.add_argument("--sfc-only", action="store_true", help="Surface vars only")
+    parser.add_argument("--pl-only",  action="store_true", help="Pressure-level only (Z500)")
+    parser.add_argument("--workers",  type=int, default=4, help="Parallel threads (default 4)")
+    parser.add_argument("--dry-run",  action="store_true", help="Print tasks, download nothing")
     args = parser.parse_args()
 
     log, log_file = setup_logging()
@@ -230,10 +220,8 @@ def main():
 
     if args.date:
         dates = [pd.Timestamp(args.date)]
-        if dates[0].day not in REFORECAST_DAYS:
-            log.warning(f"{args.date}: not a CY49R1+ reforecast day {sorted(REFORECAST_DAYS)}")
     else:
-        dates = init_dates(args.year_start, args.year_end)
+        dates = list(pd.date_range(DATE_START, DATE_END, freq="D"))
 
     ftypes = ["cf"] if args.no_pf else ["cf", "pf"]
     do_sfc = not args.pl_only
@@ -244,14 +232,14 @@ def main():
     n_done  = len(tasks) - len(pending)
 
     log.info("=" * 70)
-    log.info("ECMWF S2S Reforecast Download  (hindcast climatology)")
+    log.info("ECMWF S2S Real-Time Forecast Download  (JFM 2026)")
     log.info(f"  Data dir     : {DATA_DIR}")
     log.info(f"  Log file     : {log_file}")
-    log.info(f"  Period       : {args.year_start} – {args.year_end}  (20-yr hindcast)")
-    log.info(f"  Init dates   : {len(dates)}  ({dates[0].date()} → {dates[-1].date()})")
-    log.info(f"  Init schedule: days {sorted(REFORECAST_DAYS)} of each month (CY49R1+)")
-    log.info(f"  Members      : 11  (1 cf + 10 pf)  ← reforecast max, not 101")
+    log.info(f"  Period       : {DATE_START} → {DATE_END}")
+    log.info(f"  Init dates   : {len(dates)}  (daily, all days in JFM 2026)")
+    log.info(f"  Members      : 101  (1 cf + 100 pf)  ← real-time forecast")
     log.info(f"  Lead time    : 90 days  (steps 24–2160 h, daily)")
+    log.info(f"  Dataset      : s2s-forecasts  (NOT reforecasts)")
     log.info(f"  Fcst types   : {ftypes}")
     log.info(f"  Sfc vars     : {list(SURFACE_VARS.values()) if do_sfc else 'skipped'}")
     log.info(f"  PL vars      : z @ 500 hPa" if do_pl else "  PL vars      : skipped")
